@@ -1,0 +1,7 @@
+/*
+!.gitignore
+!prophet_service/
+!deploy_service/
+__pycache__/
+*.pyc
+.venv/

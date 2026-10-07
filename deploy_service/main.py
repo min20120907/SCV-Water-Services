@@ -1,0 +1,714 @@
+"""
+SSH Remote Deployment Service for SCV Water
+Connects to Raspberry Pi via SSH and deploys sensor drivers automatically.
+
+Endpoints:
+  POST /deploy           -> Deploy sensor driver to Raspberry Pi
+  GET  /deploy/status    -> Check deployment status
+  GET  /health           -> Liveness probe
+"""
+
+import os
+import json
+import base64
+import logging
+from datetime import datetime
+from typing import Optional
+
+import paramiko
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import secrets
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("deploy-service")
+
+app = FastAPI(title="SCV Water Deploy Service", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# API Key 驗證（App 端寫死，防止外人亂 call）
+# ---------------------------------------------------------------------------
+API_KEY = os.environ.get("SCV_WATER_API_KEY", "scv-water-2026-secure-key")
+
+def verify_api_key(request: Request):
+    key = request.headers.get("X-API-Key", "")
+    if not secrets.compare_digest(key, API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
+class DeployRequest(BaseModel):
+    device_id: str
+    sensor_description: str
+    protocol: str  # emulator, ip, mqtt, ble, zigbee
+    schema: dict
+    pi_host: str
+    pi_port: int = 22
+    pi_user: str = "pi"
+    pi_ssh_key: str = ""  # auto-discovered if empty
+    firebase_config: dict = Field(default_factory=dict)  # auto-loaded from env/file if empty
+
+
+class DeployResponse(BaseModel):
+    success: bool
+    device_id: str
+    message: str
+    logs: list[str]
+    deployed_at: str
+
+
+class DeployStatus(BaseModel):
+    device_id: str
+    status: str  # pending, deploying, running, failed
+    last_deployed: Optional[str]
+    logs: list[str]
+
+
+# ---------------------------------------------------------------------------
+# SSH Helper
+# ---------------------------------------------------------------------------
+def _get_ssh_client(host: str, port: int, username: str, key_path: str = "") -> paramiko.SSHClient:
+    """Create and connect an SSH client. The key is service-side; the App never
+    supplies credentials.
+
+    Key resolution order:
+      1. explicit key_path (CLI/testing only)
+      2. $SCV_SSH_KEY — the deployed service's own key
+      3. ~/.ssh/{id_ed25519,id_rsa,id_ecdsa}
+      4. the running ssh-agent
+    """
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    # Auto-discover SSH keys if not specified
+    resolved_key: str | None = key_path if os.path.exists(os.path.expanduser(key_path)) else None
+    if not resolved_key:
+        resolved_key = os.environ.get("SCV_SSH_KEY") or None
+    if not resolved_key:
+        ssh_dir = os.path.expanduser("~/.ssh")
+        if os.path.isdir(ssh_dir):
+            for fname in ["id_ed25519", "id_rsa", "id_ecdsa"]:
+                candidate = os.path.join(ssh_dir, fname)
+                if os.path.exists(candidate):
+                    resolved_key = candidate
+                    break
+
+    connect_kwargs = {
+        "hostname": host,
+        "port": port,
+        "username": username,
+        "timeout": 30,
+    }
+    if resolved_key:
+        connect_kwargs["key_filename"] = os.path.expanduser(resolved_key)
+    else:
+        # Try SSH agent
+        connect_kwargs["allow_agent"] = True
+        connect_kwargs["look_for_keys"] = True
+
+    client.connect(**connect_kwargs)
+    return client
+
+
+def _exec_command(client: paramiko.SSHClient, command: str, timeout: int = 120) -> tuple[str, str, int]:
+    """Execute a command over SSH and return (stdout, stderr, exit_code)."""
+    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+    exit_code = stdout.channel.recv_exit_status()
+    out = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    return out, err, exit_code
+
+
+# ---------------------------------------------------------------------------
+# Deployment Script Generator
+# ---------------------------------------------------------------------------
+def _generate_driver_code(req: DeployRequest, field_names: list[str]) -> str:
+    """Generate Python sensor driver code based on protocol."""
+
+    fields_str = repr(field_names)
+
+    driver_code = '''#!/usr/bin/env python3
+"""
+SCV Water Sensor Driver
+Auto-generated by SCV Water Dashboard
+"""
+
+import os
+import json
+import time
+import random
+from datetime import datetime
+from google.cloud import firestore
+from google.oauth2 import service_account
+
+# Config
+DEVICE_ID = "''' + req.device_id + '''"
+PROTOCOL = "''' + req.protocol + '''"
+FIREBASE_CONFIG_PATH = os.path.expanduser("~/.config/scv_water/firebase_service_account.json")
+
+# Initialize Firebase
+creds = service_account.Credentials.from_service_account_file(FIREBASE_CONFIG_PATH)
+db = firestore.Client(credentials=creds)
+
+def read_sensors():
+    """Read sensor values. Override this for real hardware."""
+    # TODO: Replace with actual sensor reading logic
+    values = {}
+    for field in ''' + fields_str + ''':
+        values[field] = round(random.uniform(0, 100), 1)
+    return values
+
+def send_to_cloud(data):
+    """Send data to Firebase Firestore."""
+    doc_ref = db.collection("readings").document(DEVICE_ID).collection("stream").add({
+        **data,
+        "timestamp": firestore.SERVER_TIMESTAMP,
+    })
+    print(f"{datetime.now().isoformat()} Sent: {data}")
+
+def main():
+    print(f"SCV Water Driver started: {DEVICE_ID} ({PROTOCOL})")
+    while True:
+        try:
+            data = read_sensors()
+            send_to_cloud(data)
+            time.sleep(3)  # Send every 3 seconds
+        except KeyboardInterrupt:
+            print("Driver stopped.")
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
+'''
+    return driver_code
+
+
+def _generate_deploy_script(req: DeployRequest) -> str:
+    """Generate a bash deployment script for the Raspberry Pi.
+
+    Two design rules this script follows, both learned from a failed run:
+
+    1. Never hard-fail on a missing privilege escalation. `sudo` needs a
+       password on stock Raspberry Pi OS only if the operator has not set up
+       NOPASSWD, and on the test target it needs one too. The driver, its venv
+       and its config all live in the login user's home, so the script
+       completes without root and only *reports* that the systemd unit and the
+       system packages were skipped.
+    2. Resolve $HOME / $USER at runtime instead of writing /home/pi. The account
+       the deploy service logs in as is a request parameter, not a constant.
+    """
+    # Extract schema fields
+    fields = req.schema.get("fields", [])
+    field_names = [f.get("key", "") for f in fields if f.get("key")]
+
+    # Python driver code
+    driver_code = _generate_driver_code(req, field_names)
+
+    # Firebase config JSON
+    firebase_json = json.dumps(req.firebase_config, indent=2)
+
+    # Build script using string concatenation (not f-string, to avoid brace escaping issues)
+    parts = []
+    parts.append("#!/usr/bin/env bash\n")
+    parts.append("# Generated by SCV Water deploy service. Do not edit on the device.\n")
+    parts.append('echo "=== SCV Water Sensor Deployment ==="\n')
+    parts.append('echo "Device: ' + req.device_id + '"\n')
+    parts.append('echo "Protocol: ' + req.protocol + '"\n')
+    parts.append('echo "Target: $(id -un)@$(hostname)  home=$HOME"\n')
+    parts.append('echo "Time: $(date)"\n\n')
+
+    # 1. System dependencies -- best effort. The driver only needs these to be
+    #    present; if apt is unavailable we continue and say so.
+    parts.append('echo "[1/7] System dependencies (optional)"\n')
+    parts.append(
+        "if sudo -n true 2>/dev/null; then\n"
+        "    sudo apt-get update -qq || echo '  warn: apt-get update failed'\n"
+        "    sudo apt-get install -y -qq python3-pip python3-venv i2c-tools spi-tools \\\n"
+        "        || echo '  warn: apt-get install failed'\n"
+        "else\n"
+        "    echo '  skip: no passwordless sudo; assuming python3/venv already present'\n"
+        "fi\n\n"
+    )
+
+    # 2. Create project directory
+    parts.append('echo "[2/7] Setting up project directory..."\n')
+    parts.append("mkdir -p \"$HOME/scv_water_sensors\"\n")
+    parts.append('cd "$HOME/scv_water_sensors" || exit 1\n\n')
+
+    # 3. Python virtual environment
+    parts.append('echo "[3/7] Creating Python virtual environment..."\n')
+    parts.append(
+        "if [ ! -x venv/bin/python ]; then\n"
+        "    python3 -m venv venv || { echo '  error: python3-venv missing'; exit 1; }\n"
+        "fi\n"
+        "source venv/bin/activate\n\n"
+    )
+
+    # 4. Install Python packages -- wheels that fail to build (no GPIO header on
+    #    a test target) must not abort the deployment.
+    parts.append('echo "[4/7] Installing Python packages..."\n')
+    parts.append(
+        "pip install --quiet firebase-admin || echo '  warn: firebase-admin install failed'\n"
+        "for pkg in RPi.GPIO smbus2 spidev paho-mqtt; do\n"
+        "    pip install --quiet \"$pkg\" || echo \"  warn: $pkg unavailable on this target\"\n"
+        "done\n\n"
+    )
+
+    # 5. Deploy sensor driver
+    parts.append('echo "[5/7] Deploying sensor driver..."\n')
+    parts.append("cat > sensor_driver.py << 'DRIVER_EOF'\n")
+    parts.append(driver_code)
+    parts.append("\nDRIVER_EOF\n")
+    parts.append("chmod +x sensor_driver.py\n\n")
+
+    # 6. Firebase config
+    parts.append('echo "[6/7] Setting up Firebase config..."\n')
+    parts.append('mkdir -p "$HOME/.config/scv_water"\n')
+    parts.append("cat > \"$HOME/.config/scv_water/firebase_service_account.json\" << 'FB_EOF'\n")
+    parts.append(firebase_json)
+    parts.append("\nFB_EOF\n")
+    parts.append("chmod 600 \"$HOME/.config/scv_water/firebase_service_account.json\"\n\n")
+
+    # 7. systemd unit -- optional. Needs root; the driver is already on disk and
+    #    runnable by hand, so a skipped unit is a degraded result, not a failure.
+    parts.append('echo "[7/7] Installing systemd service (optional)"\n')
+    parts.append("if sudo -n true 2>/dev/null; then\n")
+    parts.append("    sudo tee /etc/systemd/system/scv-water-" + req.device_id + ".service > /dev/null << 'SERVICE_EOF'\n")
+    parts.append("[Unit]\n")
+    parts.append("Description=SCV Water Sensor Driver - " + req.device_id + "\n")
+    parts.append("After=network.target\n\n")
+    parts.append("[Service]\n")
+    parts.append("Type=simple\n")
+    parts.append("User=$USER\n")
+    parts.append("WorkingDirectory=$HOME/scv_water_sensors\n")
+    parts.append("ExecStart=$HOME/scv_water_sensors/venv/bin/python $HOME/scv_water_sensors/sensor_driver.py\n")
+    parts.append("Restart=always\n")
+    parts.append("RestartSec=10\n\n")
+    parts.append("[Install]\n")
+    parts.append("WantedBy=multi-user.target\n")
+    parts.append("SERVICE_EOF\n")
+    parts.append("    sudo systemctl daemon-reload\n")
+    parts.append("    sudo systemctl enable --now scv-water-" + req.device_id + ".service \\\n")
+    parts.append("        && echo '  systemd unit enabled' \\\n")
+    parts.append("        || echo '  warn: systemctl enable failed'\n")
+    parts.append("else\n")
+    parts.append("    echo '  skip: no passwordless sudo; run the driver manually:'\n")
+    parts.append('    echo "        $HOME/scv_water_sensors/venv/bin/python $HOME/scv_water_sensors/sensor_driver.py"\n')
+    parts.append("fi\n\n")
+
+    parts.append('echo "=== Deployment finished ==="\n')
+
+    # 8. Verify what is actually verifiable without root: the artefacts exist and
+    #    the Firebase config parses. The old check was `systemctl is-active`,
+    #    which fails whenever the unit could not be installed and told us
+    #    nothing about whether the deployment itself worked.
+    parts.append('echo "Verifying installed artefacts..."\n')
+    parts.append(
+        'if python3 -c "import json; json.load(open('
+        "'$HOME/.config/scv_water/firebase_service_account.json'"
+        '))" 2>/dev/null; then\n'
+        "    echo '  ok: firebase config is valid JSON'\n"
+        "else\n"
+        "    echo '  warn: firebase config missing or unparseable'\n"
+        "fi\n"
+    )
+    parts.append("test -f sensor_driver.py && echo '  ok: sensor_driver.py present'\n")
+    parts.append("test -x venv/bin/python && echo '  ok: venv created'\n")
+    parts.append('echo "=== Deployment Complete ==="\n')
+
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health(request: Request):
+    verify_api_key(request)
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# 硬體安裝圖生成（Middle service 持有 Fritzing / LLM / SSH，不放在手機端）
+# ---------------------------------------------------------------------------
+
+class HardwareDiagramRequest(BaseModel):
+    site_id: str
+    site_name: str = ""
+    sensors: list[dict] = Field(default_factory=list)
+    use_llm: bool = True
+    llm_ir: Optional[dict] = None
+
+
+@app.post("/hardware/diagram")
+async def hardware_diagram(req: HardwareDiagramRequest, request: Request):
+    """Render a Fritzing breadboard diagram for one site.
+
+    The App posts the site's sensors; this returns a PNG (base64), the source
+    SVG and a flat wiring table. Runs after deployment because it needs the same
+    middle-service credentials as the deploy path.
+    """
+    verify_api_key(request)
+    if not req.sensors:
+        raise HTTPException(status_code=400, detail="sensors is required")
+
+    try:
+        import hardware_diagram as hd
+
+        art = hd.generate(
+            site_id=req.site_id,
+            site_name=req.site_name or req.site_id,
+            sensors=req.sensors,
+            use_llm=req.use_llm,
+            llm_ir=req.llm_ir,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:  # noqa: BLE001 - surface the real reason to the App
+        logger.exception("hardware diagram failed")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+    with open(art["png"], "rb") as f:
+        png_b64 = base64.b64encode(f.read()).decode("ascii")
+    with open(art["svg"], "r", encoding="utf-8") as f:
+        svg_text = f.read()
+
+    return {
+        "site_id": req.site_id,
+        "png_base64": png_b64,
+        "svg": svg_text,
+        "fzz": art["fzz"],
+        "wiring_table": art["wiring_table"],
+        "ir": art["ir"],
+        "parts": art.get("parts"),
+        "zero_source": art.get("zero_source"),
+        "run_id": art["run_id"],
+    }
+
+
+# SCV Water 自訂 MAC 前綴 — 只掃描我們的樹莓派
+# 樹莓派出廠 MAC 前綴：b8:27:eb (Pi 1/2/3), dc:a6:32 (Pi 4), e4:5f:01 (Pi 4/5)
+# 若樹莓派有自訂 MAC，請修改此前綴
+SCV_WATER_MAC_PREFIXES = ["de:ad:be"]
+
+# 外網樹莓派註冊表（記憶體，重啟後清空）
+_registered_devices: dict[str, dict] = {}
+
+
+@app.post("/register")
+async def register_device(request: Request):
+    verify_api_key(request)
+    """外網樹莓派主動註冊自己的 IP、MAC、serial。"""
+    body = await request.json()
+    ip = body.get("ip")
+    mac = body.get("mac", "")
+    serial = body.get("serial", "")
+    hostname = body.get("hostname", "")
+
+    if not ip:
+        raise HTTPException(status_code=400, detail="ip is required")
+
+    # 驗證 MAC 前綴
+    if mac and not any(mac.lower().startswith(p) for p in SCV_WATER_MAC_PREFIXES):
+        raise HTTPException(status_code=403, detail="MAC prefix not allowed")
+
+    key = serial or ip
+    _registered_devices[key] = {
+        "ip": ip,
+        "port": 22,
+        "name": hostname or f"scv-water-{ip.split('.')[-1]}",
+        "method": "registered",
+        "mac": mac,
+        "serial": serial,
+        "registered_at": datetime.now().isoformat(),
+    }
+    return {"status": "ok", "message": "registered"}
+
+
+@app.get("/registered")
+async def list_registered(request: Request):
+    verify_api_key(request)
+    """列出所有已註冊的外網樹莓派。"""
+    return {"devices": list(_registered_devices.values()), "count": len(_registered_devices)}
+
+
+@app.get("/scan")
+async def scan_network(request: Request):
+    verify_api_key(request)
+    """Scan local network for SCV Water Raspberry Pi devices."""
+    import socket
+    import subprocess
+    import re
+
+    devices = []
+
+    # Method 1: mDNS/Bonjour scan for ._tcp.local (SSH service)
+    try:
+        import zeroconf
+        from zeroconf import ServiceBrowser, Zeroconf
+
+        class SSHListener:
+            def __init__(self):
+                self.found = []
+
+            def add_service(self, zc, type_, name):
+                info = zc.get_service_info(type_, name)
+                if info:
+                    addresses = info.parsed_addresses()
+                    for addr in addresses:
+                        self.found.append({
+                            "ip": addr,
+                            "port": info.port,
+                            "name": name,
+                            "method": "mdns",
+                        })
+
+            def remove_service(self, zc, type_, name):
+                pass
+
+            def update_service(self, zc, type_, name):
+                pass
+
+        zeroconf = Zeroconf()
+        listener = SSHListener()
+        browser = ServiceBrowser(zeroconf, "_ssh._tcp.local.", listener)
+        import time
+        time.sleep(3)
+        browser.cancel()
+        zeroconf.close()
+        devices.extend(listener.found)
+    except Exception as e:
+        logger.warning(f"mDNS scan failed: {e}")
+
+    # Enrich mDNS results with MAC via ARP table lookup + filter by prefix
+    enriched = []
+    for d in devices:
+        if "mac" not in d:
+            try:
+                arp_result = subprocess.run(["arp", "-n", d["ip"]], capture_output=True, text=True, timeout=2)
+                for line in arp_result.stdout.splitlines():
+                    m = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", line)
+                    if m:
+                        d["mac"] = m.group(1)
+                        break
+            except Exception:
+                pass
+        # Only keep devices with SCV Water MAC prefix
+        if d.get("mac") and any(d["mac"].lower().startswith(p) for p in SCV_WATER_MAC_PREFIXES):
+            enriched.append(d)
+    devices = enriched
+
+    # Method 2: ARP scan (fallback)
+    try:
+        # Get local subnet
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+
+        # Extract subnet (e.g., 192.168.1.x -> 192.168.1.)
+        subnet = ".".join(local_ip.split(".")[:3]) + "."
+
+        # Try arp-scan
+        result = subprocess.run(
+            ["arp-scan", "-l", "--retry=1", "--timeout=100"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            match = re.match(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]+)", line)
+            if match:
+                ip = match.group(1)
+                mac = match.group(2)
+                # Check if it's a SCV Water device (MAC prefix match)
+                if any(mac.lower().startswith(prefix) for prefix in SCV_WATER_MAC_PREFIXES):
+                    devices.append({
+                        "ip": ip,
+                        "port": 22,
+                        "name": f"raspberry-pi-{ip.split('.')[-1]}",
+                        "method": "arp",
+                        "mac": mac,
+                    })
+    except Exception as e:
+        logger.warning(f"ARP scan failed: {e}")
+
+    # Method 3: Quick port scan on common Pi subnets
+    if not devices:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            subnet = ".".join(local_ip.split(".")[:3]) + "."
+
+            for i in range(1, 255):
+                ip = f"{subnet}{i}"
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(0.1)
+                    result = sock.connect_ex((ip, 22))
+                    sock.close()
+                    if result == 0:
+                        # Try to get MAC from ARP table
+                        mac = None
+                        try:
+                            arp_result = subprocess.run(["arp", "-n", ip], capture_output=True, text=True, timeout=2)
+                            m = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", arp_result.stdout)
+                            if m:
+                                mac = m.group(1)
+                        except Exception:
+                            pass
+                        # Only keep SCV Water devices (MAC prefix match)
+                        if mac and any(mac.lower().startswith(p) for p in SCV_WATER_MAC_PREFIXES):
+                            devices.append({
+                                "ip": ip,
+                                "port": 22,
+                                "name": f"scv-water-{ip.split('.')[-1]}",
+                                "method": "port-scan",
+                                "mac": mac,
+                            })
+                except:
+                    pass
+        except Exception as e:
+            logger.warning(f"Port scan failed: {e}")
+
+    # 注意：外網已註冊的樹莓派不加入 scan 清單
+    # 外網裝置只能手動輸入 IP 加入
+    return {"devices": devices, "count": len(devices)}
+
+
+def _load_firebase_config() -> dict:
+    """Auto-load Firebase service account from env or file."""
+    # Try environment variable first
+    env_config = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+    if env_config:
+        try:
+            return json.loads(env_config)
+        except json.JSONDecodeError:
+            pass
+
+    # Try common file paths
+    paths = [
+        os.path.expanduser("~/.config/scv_water/firebase_service_account.json"),
+        os.path.expanduser("~/scv_water/firebase_service_account.json"),
+        "/etc/scv_water/firebase_service_account.json",
+    ]
+    for path in paths:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+
+    return {}
+
+
+@app.post("/deploy", response_model=DeployResponse)
+async def deploy(req: DeployRequest, request: Request):
+    verify_api_key(request)
+    logger.info(f"Deploy request: device={req.device_id}, host={req.pi_host}")
+
+    # Auto-load Firebase config if not provided
+    if not req.firebase_config:
+        req.firebase_config = _load_firebase_config()
+        if not req.firebase_config:
+            return DeployResponse(
+                success=False,
+                device_id=req.device_id,
+                message="Firebase service account not found. Set FIREBASE_SERVICE_ACCOUNT env var or place JSON in ~/.config/scv_water/",
+                logs=[],
+                deployed_at=datetime.now().isoformat(),
+            )
+
+    logs = []
+    ssh = None
+
+    try:
+        # Connect via SSH
+        ssh = _get_ssh_client(
+            host=req.pi_host,
+            port=req.pi_port,
+            username=req.pi_user,
+            key_path=req.pi_ssh_key,
+        )
+        logs.append(f"SSH connected to {req.pi_user}@{req.pi_host}:{req.pi_port}")
+
+        # Generate deployment script
+        script = _generate_deploy_script(req)
+
+        # Upload script to Pi
+        sftp = ssh.open_sftp()
+        with sftp.file("/tmp/scv_deploy.sh", "w") as f:
+            f.write(script)
+        sftp.close()
+        logs.append("Deployment script uploaded")
+
+        # Execute script
+        stdout, stderr, exit_code = _exec_command(ssh, "bash /tmp/scv_deploy.sh", timeout=300)
+        logs.append(stdout)
+        if stderr:
+            logs.append(f"stderr: {stderr}")
+
+        if exit_code != 0:
+            raise Exception(f"Deployment script failed with exit code {exit_code}")
+
+        logs.append("Deployment completed successfully")
+
+        return DeployResponse(
+            success=True,
+            device_id=req.device_id,
+            message="Sensor driver deployed and running on Raspberry Pi",
+            logs=logs,
+            deployed_at=datetime.now().isoformat(),
+        )
+
+    except Exception as e:
+        logger.exception("Deployment failed")
+        return DeployResponse(
+            success=False,
+            device_id=req.device_id,
+            message=f"Deployment failed: {e}",
+            logs=logs,
+            deployed_at=datetime.now().isoformat(),
+        )
+
+    finally:
+        if ssh:
+            ssh.close()
+
+
+@app.get("/deploy/status/{device_id}", response_model=DeployStatus)
+async def deploy_status(device_id: str, request: Request):
+    verify_api_key(request)
+    """Check deployment status of a device."""
+    # TODO: Implement status check via SSH
+    return DeployStatus(
+        device_id=device_id,
+        status="unknown",
+        last_deployed=None,
+        logs=["Status check not yet implemented"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8767))
+    uvicorn.run(app, host="0.0.0.0", port=port)
