@@ -2,6 +2,8 @@
 !.gitignore
 !prophet_service/
 !deploy_service/
+!DEMO_SCENARIOS.md
+!digital_twin/
 __pycache__/
 *.pyc
 .venv/
