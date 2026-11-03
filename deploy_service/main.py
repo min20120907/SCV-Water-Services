@@ -875,6 +875,59 @@ async def deploy(req: DeployRequest, request: Request):
             ssh.close()
 
 
+class UndeployRequest(BaseModel):
+    device_id: str
+    pi_host: str
+    pi_port: int = 22
+    pi_user: str = "pi"
+    pi_ssh_key: str = ""
+
+
+@app.post("/undeploy")
+async def undeploy(req: UndeployRequest, request: Request):
+    verify_api_key(request)
+    ssh = None
+    logs = []
+    try:
+        ssh = _get_ssh_client(
+            host=req.pi_host,
+            port=req.pi_port,
+            username=req.pi_user,
+            key_path=req.pi_ssh_key,
+        )
+        cmd = f"""
+        systemctl --user stop scv-water-{req.device_id}.service 2>/dev/null || true
+        systemctl --user disable scv-water-{req.device_id}.service 2>/dev/null || true
+        rm -f $HOME/.config/systemd/user/scv-water-{req.device_id}.service
+        systemctl --user daemon-reload 2>/dev/null || true
+        if sudo -n true 2>/dev/null; then
+            sudo systemctl stop scv-water-{req.device_id}.service 2>/dev/null || true
+            sudo systemctl disable scv-water-{req.device_id}.service 2>/dev/null || true
+            sudo rm -f /etc/systemd/system/scv-water-{req.device_id}.service
+            sudo systemctl daemon-reload 2>/dev/null || true
+        fi
+        """
+        stdout, stderr, exit_code = _exec_command(ssh, cmd, timeout=30)
+        logs.append(stdout.strip())
+        return {
+            "success": True,
+            "device_id": req.device_id,
+            "message": f"Device {req.device_id} unbound and stopped on Raspberry Pi",
+            "logs": logs,
+        }
+    except Exception as e:
+        logger.exception("Undeploy failed")
+        return {
+            "success": False,
+            "device_id": req.device_id,
+            "message": f"Undeploy failed: {e}",
+            "logs": logs,
+        }
+    finally:
+        if ssh:
+            ssh.close()
+
+
 @app.get("/deploy/status/{device_id}", response_model=DeployStatus)
 async def deploy_status(device_id: str, request: Request):
     verify_api_key(request)
