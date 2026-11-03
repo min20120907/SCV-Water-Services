@@ -11,6 +11,7 @@ Endpoints:
 import os
 import json
 import base64
+import re
 import logging
 from datetime import datetime
 from typing import Optional
@@ -163,9 +164,29 @@ def _exec_command(client: paramiko.SSHClient, command: str, timeout: int = 120) 
 # ---------------------------------------------------------------------------
 # Deployment Script Generator
 # ---------------------------------------------------------------------------
+def _get_web_firebase_credentials() -> tuple[str, str]:
+    opts_path = os.path.join(os.path.dirname(__file__), "..", "scv_water_dashboard", "lib", "firebase_options.dart")
+    project_id = "login-verificati-1712467959577"
+    api_key = ""
+    if os.path.exists(opts_path):
+        try:
+            with open(opts_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            m_key = re.search(r'apiKey:\s*[\'\"]([^\'\"]+)[\'\"]', content)
+            m_proj = re.search(r'projectId:\s*[\'\"]([^\'\"]+)[\'\"]', content)
+            if m_key:
+                api_key = m_key.group(1)
+            if m_proj:
+                project_id = m_proj.group(1)
+        except Exception:
+            pass
+    return project_id, api_key
+
+
 def _generate_driver_code(req: DeployRequest, field_names: list[str]) -> str:
     """Generate Python sensor driver code integrated with Digital Twin emulator."""
     fields_str = repr(field_names)
+    project_id, web_api_key = _get_web_firebase_credentials()
 
     driver_code = '''#!/usr/bin/env python3
 """
@@ -195,6 +216,8 @@ except Exception as e:
 # Config
 DEVICE_ID = "''' + req.device_id + '''"
 PROTOCOL = "''' + req.protocol + '''"
+PROJECT_ID = "''' + project_id + '''"
+WEB_API_KEY = "''' + web_api_key + '''"
 FIREBASE_CONFIG_PATH = os.path.expanduser("~/.config/scv_water/firebase_service_account.json")
 
 # Initialize Firebase
@@ -253,17 +276,40 @@ def read_sensors():
     return values
 
 def send_to_cloud(data):
-    """Send data to Firebase Firestore."""
+    """Send data to Firebase Firestore (SDK or REST fallback)."""
     if db is not None:
         try:
             doc_ref = db.collection("readings").document(DEVICE_ID).collection("stream").add({
                 **data,
                 "timestamp": firestore.SERVER_TIMESTAMP,
             })
-            print(f"{datetime.now().isoformat()} Sent: {data}")
+            print(f"{datetime.now().isoformat()} Sent (SDK): {data.get('time')} flow={data.get('flow')}")
             return
         except Exception as e:
-            print(f"Firestore send error: {e}")
+            print(f"Firestore SDK send error: {e}")
+
+    if PROJECT_ID and WEB_API_KEY:
+        try:
+            import urllib.request
+            url = f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}/databases/(default)/documents/readings/{DEVICE_ID}/stream?key={WEB_API_KEY}"
+            fs_fields = {}
+            for k, v in data.items():
+                if isinstance(v, bool):
+                    fs_fields[k] = {"booleanValue": v}
+                elif isinstance(v, (int, float)):
+                    fs_fields[k] = {"doubleValue": float(v)}
+                elif isinstance(v, str):
+                    fs_fields[k] = {"stringValue": v}
+            fs_fields["timestamp"] = {"timestampValue": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+            req_body = json.dumps({"fields": fs_fields}).encode("utf-8")
+            h_req = urllib.request.Request(url, data=req_body, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(h_req, timeout=5) as resp:
+                if resp.status in (200, 201):
+                    print(f"{datetime.now().isoformat()} Sent (REST): {data.get('time')} flow={data.get('flow')}")
+                    return
+        except Exception as e:
+            print(f"Firestore REST error: {e}")
+
     print(f"{datetime.now().isoformat()} Emulated reading: {data}")
 
 def main():
@@ -404,7 +450,7 @@ def _generate_deploy_script(req: DeployRequest) -> str:
     parts.append("WantedBy=multi-user.target\n")
     parts.append("SERVICE_EOF\n")
     parts.append("    sudo systemctl daemon-reload\n")
-    parts.append("    sudo systemctl enable --now scv-water-" + req.device_id + ".service \\\n")
+    parts.append("    sudo systemctl enable --now scv-water-" + req.device_id + ".service && sudo systemctl restart scv-water-" + req.device_id + ".service \\\n")
     parts.append("        && echo '  systemd unit enabled (system)' \\\n")
     parts.append("        || echo '  warn: systemctl enable failed'\n")
     parts.append("else\n")
@@ -424,7 +470,7 @@ def _generate_deploy_script(req: DeployRequest) -> str:
     parts.append("WantedBy=default.target\n")
     parts.append("USER_SERVICE_EOF\n")
     parts.append("    systemctl --user daemon-reload\n")
-    parts.append("    systemctl --user enable --now scv-water-" + req.device_id + ".service \\\n")
+    parts.append("    systemctl --user enable --now scv-water-" + req.device_id + ".service && systemctl --user restart scv-water-" + req.device_id + ".service \\\n")
     parts.append("        && echo '  systemd unit enabled (user)' \\\n")
     parts.append("        || echo '  warn: user systemctl enable failed'\n")
     parts.append("fi\n\n")
