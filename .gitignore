@@ -2,6 +2,7 @@
 !.gitignore
 !prophet_service/
 !deploy_service/
+!deploy_cli.py
 !DEMO_SCENARIOS.md
 !digital_twin/
 __pycache__/

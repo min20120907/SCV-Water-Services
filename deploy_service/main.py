@@ -12,6 +12,8 @@ import os
 import json
 import base64
 import re
+import time
+import urllib.request
 import logging
 from datetime import datetime
 from typing import Optional
@@ -209,6 +211,15 @@ except ImportError:
 try:
     from twin_engine import WaterDigitalTwin
     twin = WaterDigitalTwin()
+    # Default to active demo scenario so sensor values are dynamically non-zero
+    twin.set_scenario("morning_garden")
+    twin.state.valve_1 = True
+    twin.state.valve_2 = True
+    twin.state.flow_rate_lpm = 4.5
+    twin.state.water_level_pct = 58.0
+    twin.state.tds_ppm = 135.0
+    twin.state.ambient_temp_c = 26.5
+    twin.state.humidity_pct = 68.0
 except Exception as e:
     print(f"Digital Twin load note: {e}")
     twin = None
@@ -561,6 +572,156 @@ async def hardware_diagram(req: HardwareDiagramRequest, request: Request):
         "parts": art.get("parts"),
         "zero_source": art.get("zero_source"),
         "run_id": art["run_id"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 全自動一鍵流水線：輸入型號與場域 -> Qwen 生成規格 -> SSH 部署 -> 配線圖 -> Firestore
+# ---------------------------------------------------------------------------
+def _call_qwen_schema(model_text: str) -> dict:
+    url = "http://127.0.0.1:8088/v1/chat/completions"
+    sys_prompt = """You are an IoT Sensor Expert. Convert the user's sensor model or description into a JSON Schema.
+Output MUST be a valid JSON object only with this structure:
+{
+  "type_id": "DEVICE_TYPE_NAME",
+  "protocol": "gpio|i2c|spi",
+  "fields": [
+    {
+      "key": "internal_variable_name",
+      "label": "Human Readable Label",
+      "unit": "Unit (e.g. mL/s, mg/L, hPa, °C)",
+      "data_type": "double or int"
+    }
+  ]
+}
+Return ONLY valid JSON. No conversational text."""
+    payload = {
+        "model": "qwen3.8-27b-fastmtp",
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": f"Sensor Model / Description:\n{model_text}"}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 512
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as res:
+        data = json.loads(res.read())
+    raw = data["choices"][0]["message"]["content"]
+    clean = re.sub(r"<think>[\s\S]*?</think>", "", raw).strip()
+    clean = re.sub(r"^```json\s*", "", clean)
+    clean = re.sub(r"^```\s*", "", clean)
+    clean = re.sub(r"\s*```$", "", clean)
+    return json.loads(clean)
+
+
+class PipelineRequest(BaseModel):
+    model: str
+    site_id: str
+    site_name: str = ""
+    place: str = ""
+    device_id: Optional[str] = None
+    pi_host: str = "ssh.labertus.online"
+    pi_port: int = 22
+    pi_user: str = "pi"
+
+
+@app.post("/pipeline/deploy")
+async def pipeline_deploy(req: PipelineRequest, request: Request):
+    verify_api_key(request)
+    # 1. Qwen Schema Generation
+    t0_llm = time.time()
+    try:
+        schema = _call_qwen_schema(req.model)
+    except Exception as e:
+        logger.exception("Qwen schema generation failed")
+        raise HTTPException(status_code=502, detail=f"LLM Schema Generation Failed: {e}")
+    t_llm = round(time.time() - t0_llm, 2)
+
+    dev_id = req.device_id or f"{schema.get('type_id', 'DEV')}_{secrets.token_hex(2).upper()}"
+    protocol = schema.get("protocol", "gpio")
+
+    # 2. Deploy to Pi via SSH
+    t0_dep = time.time()
+    dep_req = DeployRequest(
+        device_id=dev_id,
+        sensor_description=req.model,
+        protocol=protocol,
+        schema=schema,
+        pi_host=req.pi_host,
+        pi_port=req.pi_port,
+        pi_user=req.pi_user,
+    )
+    dep_res = await deploy(dep_req, request)
+    t_dep = round(time.time() - t0_dep, 2)
+
+    # 3. Fritzing Diagram Generation
+    t0_diag = time.time()
+    import hardware_diagram as hd
+    art = hd.generate(
+        site_id=req.site_id,
+        site_name=req.site_name or req.site_id,
+        sensors=[{"id": dev_id, "name": req.model, "description": req.model, "protocol": protocol}],
+        use_llm=False,
+    )
+    t_diag = round(time.time() - t0_diag, 2)
+
+    with open(art["png"], "rb") as f:
+        png_b64 = base64.b64encode(f.read()).decode("ascii")
+
+    # 4. Register in Firestore so App instantly displays the new sensor
+    project_id, web_api_key = _get_web_firebase_credentials()
+    if project_id and web_api_key:
+        try:
+            fs_url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/sensors/{dev_id}?key={web_api_key}"
+            fs_fields = {
+                "id": {"stringValue": dev_id},
+                "place": {"stringValue": req.place or req.model},
+                "site_id": {"stringValue": req.site_id},
+                "site_name": {"stringValue": req.site_name or req.site_id},
+                "connection_profile": {
+                    "mapValue": {"fields": {"protocol": {"stringValue": protocol}, "status": {"stringValue": "active"}}}
+                },
+                "schema": {
+                    "mapValue": {
+                        "fields": {
+                            "fields": {
+                                "arrayValue": {
+                                    "values": [
+                                        {
+                                            "mapValue": {
+                                                "fields": {
+                                                    "key": {"stringValue": f.get("key", "")},
+                                                    "label": {"stringValue": f.get("label", "")},
+                                                    "unit": {"stringValue": f.get("unit", "")},
+                                                }
+                                            }
+                                        }
+                                        for f in schema.get("fields", [])
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+            fs_req = urllib.request.Request(fs_url, data=json.dumps({"fields": fs_fields}).encode("utf-8"),
+                                           headers={"Content-Type": "application/json"}, method="PATCH")
+            with urllib.request.urlopen(fs_req, timeout=10):
+                pass
+        except Exception as e:
+            logger.warning(f"Firestore sensor registration error: {e}")
+
+    return {
+        "success": dep_res.success,
+        "device_id": dev_id,
+        "model": req.model,
+        "site_id": req.site_id,
+        "schema": schema,
+        "timings": {"llm_sec": t_llm, "deploy_sec": t_dep, "diagram_sec": t_diag},
+        "wiring_table": art["wiring_table"],
+        "png_path": art["png"],
+        "png_base64": png_b64,
     }
 
 
