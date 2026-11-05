@@ -414,15 +414,16 @@ def _generate_deploy_script(req: DeployRequest) -> str:
     )
 
     # 5. Deploy digital twin & sensor driver
+    driver_filename = f"sensor_driver_{req.device_id}.py"
     parts.append('echo "[5/7] Deploying digital twin & sensor driver..."\n')
     if twin_engine_code:
         parts.append("cat > twin_engine.py << 'TWIN_EOF'\n")
         parts.append(twin_engine_code)
         parts.append("\nTWIN_EOF\n")
-    parts.append("cat > sensor_driver.py << 'DRIVER_EOF'\n")
+    parts.append(f"cat > {driver_filename} << 'DRIVER_EOF'\n")
     parts.append(driver_code)
     parts.append("\nDRIVER_EOF\n")
-    parts.append("chmod +x sensor_driver.py\n\n")
+    parts.append(f"chmod +x {driver_filename}\n\n")
 
     # 6. Firebase config
     parts.append('echo "[6/7] Setting up Firebase config..."\n')
@@ -443,7 +444,7 @@ def _generate_deploy_script(req: DeployRequest) -> str:
     parts.append("Type=simple\n")
     parts.append("User=$USER\n")
     parts.append("WorkingDirectory=$HOME/scv_water_sensors\n")
-    parts.append("ExecStart=$HOME/scv_water_sensors/venv/bin/python $HOME/scv_water_sensors/sensor_driver.py\n")
+    parts.append(f"ExecStart=$HOME/scv_water_sensors/venv/bin/python $HOME/scv_water_sensors/{driver_filename}\n")
     parts.append("Restart=always\n")
     parts.append("RestartSec=10\n\n")
     parts.append("[Install]\n")
@@ -463,7 +464,7 @@ def _generate_deploy_script(req: DeployRequest) -> str:
     parts.append("[Service]\n")
     parts.append("Type=simple\n")
     parts.append("WorkingDirectory=%h/scv_water_sensors\n")
-    parts.append("ExecStart=%h/scv_water_sensors/venv/bin/python %h/scv_water_sensors/sensor_driver.py\n")
+    parts.append(f"ExecStart=%h/scv_water_sensors/venv/bin/python %h/scv_water_sensors/{driver_filename}\n")
     parts.append("Restart=always\n")
     parts.append("RestartSec=10\n\n")
     parts.append("[Install]\n")
@@ -489,7 +490,7 @@ def _generate_deploy_script(req: DeployRequest) -> str:
         "fi\n"
     )
     parts.append("test -f twin_engine.py && echo '  ok: twin_engine.py present'\n")
-    parts.append("test -f sensor_driver.py && echo '  ok: sensor_driver.py present'\n")
+    parts.append(f"test -f {driver_filename} && echo '  ok: {driver_filename} present'\n")
     parts.append("test -x venv/bin/python && echo '  ok: venv created'\n")
     parts.append('echo "=== Deployment Complete ==="\n')
 
@@ -899,11 +900,13 @@ async def undeploy(req: UndeployRequest, request: Request):
         systemctl --user stop scv-water-{req.device_id}.service 2>/dev/null || true
         systemctl --user disable scv-water-{req.device_id}.service 2>/dev/null || true
         rm -f $HOME/.config/systemd/user/scv-water-{req.device_id}.service
+        rm -f $HOME/scv_water_sensors/sensor_driver_{req.device_id}.py
         systemctl --user daemon-reload 2>/dev/null || true
         if sudo -n true 2>/dev/null; then
             sudo systemctl stop scv-water-{req.device_id}.service 2>/dev/null || true
             sudo systemctl disable scv-water-{req.device_id}.service 2>/dev/null || true
             sudo rm -f /etc/systemd/system/scv-water-{req.device_id}.service
+            sudo rm -f /home/*/scv_water_sensors/sensor_driver_{req.device_id}.py 2>/dev/null || true
             sudo systemctl daemon-reload 2>/dev/null || true
         fi
         """
