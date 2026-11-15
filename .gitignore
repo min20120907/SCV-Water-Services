@@ -8,3 +8,5 @@
 __pycache__/
 *.pyc
 .venv/
+deploy_service/research_registry.json
+deploy_service/pin_registry.json

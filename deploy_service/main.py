@@ -615,6 +615,90 @@ Return ONLY valid JSON. No conversational text."""
     return json.loads(clean)
 
 
+class HardwareInspectRequest(BaseModel):
+    pi_host: str = "ssh.labertus.online"
+    pi_port: int = 22
+    pi_user: str = "admin"
+
+
+@app.get("/hardware/inspect")
+@app.post("/hardware/inspect")
+async def hardware_inspect(request: Request, req: Optional[HardwareInspectRequest] = None):
+    verify_api_key(request)
+    host = req.pi_host if req else "ssh.labertus.online"
+    port = req.pi_port if req else 22
+    user = req.pi_user if req else "admin"
+
+    script = (
+        "~/scv_water_sensors/venv/bin/python - <<'EOF'\n"
+        "import json, subprocess, os\n"
+        "res = {}\n"
+        "try:\n"
+        "    ps = subprocess.check_output(['pgrep', '-af', 'sensor_driver'], text=True)\n"
+        "    sensors = []\n"
+        "    for line in ps.strip().splitlines():\n"
+        "        parts = line.split(None, 1)\n"
+        "        if len(parts) == 2 and 'sensor_driver_' in parts[1]:\n"
+        "            pid, cmd = parts\n"
+        "            name = os.path.basename(cmd.split()[-1]).replace('sensor_driver_', '').replace('.py', '')\n"
+        "            if name and name != 'EOF':\n"
+        "                sensors.append({'pid': int(pid), 'name': name})\n"
+        "    res['sensors'] = sensors\n"
+        "except Exception:\n"
+        "    res['sensors'] = []\n"
+        "try:\n"
+        "    usb_out = subprocess.check_output(['lsusb'], text=True)\n"
+        "    res['usb'] = [l.strip() for l in usb_out.strip().splitlines() if l.strip()]\n"
+        "except Exception:\n"
+        "    res['usb'] = []\n"
+        "i2c = {}\n"
+        "try:\n"
+        "    import smbus2\n"
+        "    for b in [1, 2]:\n"
+        "        found = []\n"
+        "        try:\n"
+        "            bus = smbus2.SMBus(b)\n"
+        "            for a in range(0x03, 0x78):\n"
+        "                try:\n"
+        "                    bus.read_byte(a)\n"
+        "                    found.append(f'0x{a:02X}')\n"
+        "                except Exception:\n"
+        "                    pass\n"
+        "            bus.close()\n"
+        "            i2c[f'bus_{b}'] = found\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "except Exception:\n"
+        "    pass\n"
+        "res['i2c'] = i2c\n"
+        "gpio = []\n"
+        "try:\n"
+        "    p_out = subprocess.check_output(['pinctrl', 'get', '2,3,4,17,18,22,23,24,27'], text=True)\n"
+        "    for line in p_out.strip().splitlines():\n"
+        "        if '//' in line:\n"
+        "            gpio.append(line.split('//')[-1].strip())\n"
+        "        elif line.strip():\n"
+        "            gpio.append(line.strip())\n"
+        "except Exception:\n"
+        "    pass\n"
+        "res['gpio'] = gpio\n"
+        "print(json.dumps(res))\n"
+        "EOF\n"
+    )
+
+    try:
+        ssh = _get_ssh_client(host=host, port=port, username=user)
+        out, err, rc = _exec_command(ssh, script, timeout=15)
+        ssh.close()
+        for line in reversed(out.splitlines()):
+            if line.strip().startswith("{"):
+                data = json.loads(line)
+                return {"success": True, "host": host, "port": port, "user": user, **data}
+        return {"success": False, "error": f"no json in output: {out} {err}"}
+    except Exception as e:
+        return {"success": False, "error": str(e), "host": host}
+
+
 class PipelineRequest(BaseModel):
     model: str
     site_id: str
@@ -724,6 +808,432 @@ async def pipeline_deploy(req: PipelineRequest, request: Request):
         "png_base64": png_b64,
     }
 
+
+# ---------------------------------------------------------------------------
+# RESEARCH phase: web datasheet -> LLM codegen -> on-Pi selftest -> registry
+# ---------------------------------------------------------------------------
+import urllib.error
+
+import sensors_deploy as sd
+
+
+def _driver_py_path() -> str:
+    return str(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pi_driver", "driver.py"))
+
+
+def _pi_dir(device_id: str) -> str:
+    return f'$HOME/scv_water_sensors/{device_id}'
+
+
+def _pi_setup_command(device_id: str) -> str:
+    """Create the per-device dir, venv and deps (idempotent; deps marker)."""
+    d = _pi_dir(device_id)
+    return (
+        'set -e; mkdir -p ' + d + '; cd ' + d + '; '
+        'if [ ! -d venv ] && [ -d ~/scv_water_sensors/venv ]; then ln -s ~/scv_water_sensors/venv venv; fi; '
+        'if [ ! -x venv/bin/python ]; then python3 -m venv venv; fi; '
+        'if [ ! -f .deps_ok ] && [ ! -L venv ]; then '
+        'venv/bin/pip install --quiet smbus2 lgpio RPi.GPIO google-cloud-firestore firebase-admin '
+        '|| echo "  warn: some pip deps unavailable"; '
+        'touch .deps_ok; fi; '
+        'echo SETUP_OK'
+    )
+
+
+def _parse_selftest(stdout: str) -> dict:
+    """The contract: exactly ONE JSON line from --selftest (exit 0)."""
+    for line in reversed([l for l in stdout.splitlines() if l.strip().startswith("{")]):
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    return {"ok": False, "error": "bad_code",
+            "detail": f"selftest produced no JSON line; tail: {stdout[-400:]}"}
+
+
+def _pi_selftest(ssh: paramiko.SSHClient, device_id: str) -> dict:
+    out, err, rc = _exec_command(
+        ssh,
+        'cd ' + _pi_dir(device_id) + ' && ./venv/bin/python driver.py --config config.json --selftest 2>&1',
+        timeout=180,
+    )
+    if rc == 0:
+        return _parse_selftest(out)
+    return {"ok": False, "error": "bad_code",
+            "detail": f"selftest exited {rc}; tail: {(out + err)[-400:]}"}
+
+
+def _write_site_schema_fs(site_id: str, site_name: str, place: str,
+                          model: str, device_id: str, entry: dict) -> tuple[str, bool]:
+    """Register the site schema in Firestore (REST, web API key).
+
+    Site doc: {name, location, type, sensors: {model: {id, type, fields, pins,
+    bus, address, k?}}, updated_at}. Merges into an existing sensors map.
+    Returns (project_id, success).
+    """
+    _, web_api_key = _get_web_firebase_credentials()
+    if not web_api_key:
+        return "", False
+    sensor_doc = {
+        "id": {"stringValue": device_id},
+        "type": {"stringValue": entry.get("type", "custom")},
+        "fields": {"arrayValue": {"values": [
+            {"mapValue": {"fields": {
+                "key": {"stringValue": f.get("key", "")},
+                "label": {"stringValue": f.get("label", "")},
+                "unit": {"stringValue": f.get("unit", "")},
+                "min": {"doubleValue": float(f["min"])} if f.get("min") is not None else {"nullValue": {}},
+                "max": {"doubleValue": float(f["max"])} if f.get("max") is not None else {"nullValue": {}},
+            }}} for f in entry.get("fields", [])
+        ]}},
+    }
+    for opt in ("pins", "bus", "address", "k"):
+        if entry.get(opt) is not None:
+            v = entry[opt]
+            sensor_doc[opt] = {"mapValue": {"fields": {
+                str(kk): {"intValue": vv} for kk, vv in v.items()}}} if isinstance(v, dict) \
+                else {"intValue": int(v)}
+
+    last_err = ""
+    for pid in (sd.FIRESTORE_PROJECT, sd.FIRESTORE_PROJECT_FALLBACK):
+        base = f"https://firestore.googleapis.com/v1/projects/{pid}/databases/(default)/documents/sites/{site_id}"
+        url = f"{base}?key={web_api_key}"
+        try:
+            sensors_map: dict = {}
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url), timeout=10) as r:
+                    doc = json.loads(r.read()).get("fields", {})
+                    sensors_map = (doc.get("sensors", {}).get("mapValue", {}).get("fields", {}))
+            except urllib.error.HTTPError:
+                pass  # doc doesn't exist yet
+            sensors_map[model] = {"mapValue": {"fields": sensor_doc}}
+            fields = {
+                "name": {"stringValue": site_name or site_id},
+                "location": {"stringValue": place or ""},
+                "type": {"stringValue": "site"},
+                "sensors": {"mapValue": {"fields": sensors_map}},
+                "updated_at": {"timestampValue": datetime.utcnow().isoformat() + "Z"},
+            }
+            req = urllib.request.Request(url, data=json.dumps({"fields": fields}).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"}, method="PATCH")
+            with urllib.request.urlopen(req, timeout=10):
+                return pid, True
+        except Exception as e:  # noqa: BLE001 - try next project, then give up
+            last_err = str(e)
+    logger.warning(f"Firestore site schema registration failed for {site_id}: {last_err}")
+    return "", False
+
+
+class ResearchRequest(BaseModel):
+    model: str
+    site_id: str
+    site_name: str = ""
+    place: str = ""
+    device_id: Optional[str] = None
+    pi_host: str = "ssh.labertus.online"
+    pi_port: int = 22
+    pi_user: str = "admin"
+    max_attempts: int = 3
+    force_research: bool = False
+
+
+@app.post("/pipeline/research")
+async def pipeline_research(req: ResearchRequest, request: Request):
+    """RESEARCH phase: datasheet facts -> driver code -> on-Pi selftest gate.
+
+    success=true ONLY if the on-Pi selftest returns ok:true. With no sensor
+    wired, i2c/gpio drivers honestly report no_device -- that is a correct,
+    verified result, reported as success=false with the scan evidence.
+    """
+    verify_api_key(request)
+    if not os.path.exists(_driver_py_path()):
+        raise HTTPException(
+            status_code=503,
+            detail=f"pi driver missing at {_driver_py_path()} -- "
+                   "the pi_driver/driver.py module is not written yet")
+
+    mode = "research" if (req.force_research or sd.normalise_model(req.model)[0] is None) else "catalog"
+    norm_type = sd.normalise_model(req.model)[1]
+    device_id = req.device_id or f"{norm_type.upper()}_{secrets.token_hex(2).upper()}"
+
+    logs: list[str] = []
+    code = ""
+    sources: list[dict] = []
+    protocol = ""
+
+    # a+b+d. Normalise / web research / codegen / pin allocation
+    try:
+        cfg, code, sources, protocol = sd.research(req.model, req.site_id, force_research=req.force_research)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("research failed")
+        return {
+            "success": False, "verified": False, "device_id": device_id,
+            "model": req.model, "normalized_type": sd.normalise_model(req.model)[1],
+            "mode": mode, "sources": [], "fields": [], "config": {},
+            "readings": None, "attempts": 0,
+            "message": f"Research failed: {e}", "logs_tail": "\n".join(logs),
+        }
+    logs.append(f"mode={mode} protocol={protocol} config={json.dumps(cfg, ensure_ascii=False)[:300]}")
+
+    project_id, web_api_key = _get_web_firebase_credentials()
+    full_config = {
+        "device_id": device_id,
+        "site_id": req.site_id,
+        **cfg,
+        "project_id": sd.FIRESTORE_PROJECT,
+        "web_api_key": web_api_key,
+    }
+    # The generated/hand-written driver source MUST reach the Pi for the
+    # first selftest; the fix-loop below only re-uploads it *after* a failure.
+    if code:
+        full_config["code"] = code
+
+    # e. TEST-ON-PI gate (max `max_attempts` attempts; code fix loop for custom)
+    max_attempts = max(1, min(req.max_attempts, 3))
+    attempts = 0
+    result: dict = {}
+    last_code = code
+    ssh = None
+    try:
+        ssh = _get_ssh_client(host=req.pi_host, port=req.pi_port, username=req.pi_user)
+        logs.append(f"SSH connected to {req.pi_user}@{req.pi_host}")
+        setup_out, setup_err, setup_rc = _exec_command(ssh, _pi_setup_command(device_id), timeout=600)
+        logs.append(setup_out.strip()[-300:] or f"setup rc={setup_rc} {setup_err.strip()[-300:]}")
+        if setup_rc != 0 or "SETUP_OK" not in setup_out:
+            raise RuntimeError(f"Pi setup failed rc={setup_rc}: {setup_err.strip()[-300:]}")
+
+        import tempfile as _tf
+        with open(_driver_py_path(), "rb") as f:
+            driver_src = f.read().decode("utf-8")
+        with _tf.TemporaryDirectory() as td:
+            with open(os.path.join(td, "driver.py"), "w", encoding="utf-8") as f:
+                f.write(driver_src)
+            with open(os.path.join(td, "config.json"), "w", encoding="utf-8") as f:
+                json.dump(full_config, f, ensure_ascii=False, indent=2)
+            sftp = ssh.open_sftp()
+            rdir = sftp.normalize(".") + f"/scv_water_sensors/{device_id}"
+            sftp.put(os.path.join(td, "driver.py"), rdir + "/driver.py")
+            sftp.put(os.path.join(td, "config.json"), rdir + "/config.json")
+            sftp.close()
+        logs.append("driver.py + config.json uploaded")
+
+        for attempts in range(1, max_attempts + 1):
+            result = _pi_selftest(ssh, device_id)
+            logs.append(f"selftest attempt {attempts}: ok={result.get('ok')} error={result.get('error')}")
+            if result.get("ok"):
+                break
+            if attempts < max_attempts and cfg.get("type") == "custom":
+                try:
+                    raw = sd.qwen_call([
+                        {"role": "system", "content": sd.CODEGEN_SYSTEM},
+                        {"role": "user", "content": sd.fix_prompt(
+                            req.model, last_code, result, "", protocol, cfg.get("pins", {}))},
+                    ], max_tokens=8000, timeout=420)
+                    fixed = sd._extract_json(raw)
+                    if fixed.get("code"):
+                        last_code = fixed["code"]
+                        full_config["code"] = last_code
+                        with _tf.TemporaryDirectory() as td:
+                            p = os.path.join(td, "config.json")
+                            with open(p, "w", encoding="utf-8") as f:
+                                json.dump(full_config, f, ensure_ascii=False, indent=2)
+                            sftp = ssh.open_sftp()
+                            rdir = sftp.normalize(".") + f"/scv_water_sensors/{device_id}"
+                            sftp.put(p, rdir + "/config.json")
+                            sftp.close()
+                        logs.append(f"attempt {attempts + 1}: re-uploaded fixed code")
+                except Exception as e:  # noqa: BLE001
+                    logs.append(f"code fix failed: {e}")
+            elif attempts < max_attempts:
+                logs.append("retrying selftest (catalog driver, hardware may be settling)")
+    except Exception as e:  # noqa: BLE001
+        logger.exception("research selftest phase failed")
+        return {
+            "success": False, "verified": False, "device_id": device_id,
+            "model": req.model, "normalized_type": cfg.get("type"),
+            "mode": mode, "sources": sources, "fields": cfg.get("fields", []),
+            "config": full_config, "readings": None, "attempts": attempts,
+            "message": f"Pi selftest phase failed: {e}",
+            "logs_tail": "\n".join(logs)[-2000:],
+        }
+    finally:
+        if ssh:
+            ssh.close()
+
+    # g. persist registry so /pipeline/deploy-draft can reuse without re-researching
+    reg = sd.load_json(sd.RESEARCH_REGISTRY_PATH, {})
+    reg[device_id] = {
+        "model": req.model, "mode": mode, "sources": sources,
+        "fields": cfg.get("fields", []), "config": full_config,
+        "protocol": protocol, "code": last_code if cfg.get("type") == "custom" else None,
+        "verified": bool(result.get("ok")), "attempts": attempts,
+        "result": result, "ts": datetime.now().isoformat(),
+        "site_id": req.site_id, "site_name": req.site_name, "place": req.place,
+    }
+    sd.save_json(sd.RESEARCH_REGISTRY_PATH, reg)
+
+    ok = bool(result.get("ok"))
+    detail = result.get("detail") or ""
+    evidence = result.get("evidence") or {}
+    if ok:
+        message = f"Selftest passed on {req.pi_host}: sensor verified."
+    else:
+        err_code = result.get("error") or "unknown"
+        if err_code in ("no_device", "bus_error", "timeout"):
+            message = (
+                f"Driver ran on {req.pi_host} but the sensor was NOT detected "
+                f"(error={err_code}). This is an honest hardware result, not a system "
+                f"failure — wire/power the sensor and re-run. "
+                f"Evidence: {json.dumps(evidence, ensure_ascii=False)[:400]} {detail[:200]}"
+            )
+        else:
+            message = f"Selftest failed: error={err_code} detail={detail[:300]} evidence={json.dumps(evidence, ensure_ascii=False)[:300]}"
+
+    return {
+        "success": ok,
+        "verified": ok,
+        "device_id": device_id,
+        "model": req.model,
+        "normalized_type": cfg.get("type"),
+        "mode": mode,
+        "sources": sources,
+        "fields": cfg.get("fields", []),
+        "config": full_config,
+        "readings": result.get("samples"),
+        "attempts": attempts,
+        "message": message,
+        "logs_tail": "\n".join(logs)[-2000:],
+    }
+
+
+class DeployDraftRequest(BaseModel):
+    device_id: Optional[str] = None
+    model: Optional[str] = None
+    site_id: str
+    site_name: str = ""
+    place: str = ""
+    force: bool = False
+    pi_host: str = "ssh.labertus.online"
+    pi_port: int = 22
+    pi_user: str = "admin"
+
+
+@app.post("/pipeline/deploy-draft")
+async def pipeline_deploy_draft(req: DeployDraftRequest, request: Request):
+    """Deploy a verified research draft as a systemd user unit + Firestore schema.
+
+    Refuses unless the research selftest was ok (or force=true).
+    """
+    verify_api_key(request)
+    reg = sd.load_json(sd.RESEARCH_REGISTRY_PATH, {})
+
+    device_id = req.device_id
+    if not device_id and req.model and req.site_id:
+        for did, entry in reg.items():
+            if entry.get("model") == req.model and entry.get("site_id") == req.site_id:
+                device_id = did
+                break
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id (or model+site_id) is required")
+    entry = reg.get(device_id)
+    if entry is None:
+        raise HTTPException(status_code=404,
+                            detail=f"no research registry entry for {device_id}; run /pipeline/research first")
+
+    if not entry.get("verified") and not req.force:
+        return {
+            "success": False, "device_id": device_id, "service": None,
+            "verified": False, "readings": (entry.get("result") or {}).get("samples"),
+            "message": ("Refusing to deploy: the on-Pi selftest was never ok "
+                        f"(error={(entry.get('result') or {}).get('error')}). "
+                        "Pass force=true to deploy anyway."),
+        }
+
+    service = f"scv-water-{device_id}.service"
+    logs: list[str] = []
+    ssh = None
+    try:
+        ssh = _get_ssh_client(host=req.pi_host, port=req.pi_port, username=req.pi_user)
+        setup_out, setup_err, setup_rc = _exec_command(ssh, _pi_setup_command(device_id), timeout=600)
+        if setup_rc != 0 or "SETUP_OK" not in setup_out:
+            raise RuntimeError(f"Pi setup failed: {setup_err.strip()[-300:]}")
+
+        config = dict(entry.get("config") or {})
+        config.setdefault("device_id", device_id)
+        config["site_id"] = req.site_id
+        if entry.get("code"):
+            config["code"] = entry["code"]
+
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            sftp = ssh.open_sftp()
+            rdir = sftp.normalize(".") + f"/scv_water_sensors/{device_id}"
+            with open(_driver_py_path(), "rb") as f:
+                sftp.putfo(f, rdir + "/driver.py")
+            with open(os.path.join(td, "config.json"), "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            sftp.put(os.path.join(td, "config.json"), rdir + "/config.json")
+            sftp.close()
+        logs.append("config uploaded")
+
+        d = _pi_dir(device_id)
+        unit = (
+            "[Unit]\n"
+            f"Description=SCV Water sensor driver - {device_id}\n"
+            "After=network.target\n\n"
+            "[Service]\n"
+            "Type=simple\n"
+            f"WorkingDirectory=%h/scv_water_sensors/{device_id}\n"
+            f"ExecStart=%h/scv_water_sensors/{device_id}/venv/bin/python "
+            f"%h/scv_water_sensors/{device_id}/driver.py --config %h/scv_water_sensors/{device_id}/config.json\n"
+            "Restart=on-failure\n"
+            "RestartSec=10\n\n"
+            "[Install]\n"
+            "WantedBy=default.target\n"
+        )
+        write_cmd = (
+            f"mkdir -p $HOME/.config/systemd/user && cat > $HOME/.config/systemd/user/{service} << 'SCV_UNIT_EOF'\n"
+            f"{unit}\nSCV_UNIT_EOF\n"
+            f"systemctl --user daemon-reload && "
+            f"systemctl --user enable --now {service} && "
+            f"systemctl --user restart {service} && sleep 1 && "
+            f"echo ACTIVE=$(systemctl --user is-active {service})"
+        )
+        out, err, rc = _exec_command(ssh, write_cmd, timeout=120)
+        logs.append(out.strip()[-300:] or f"rc={rc} {err.strip()[-300:]}")
+        if rc != 0:
+            raise RuntimeError(f"systemd install failed rc={rc}: {err.strip()[-300:]}")
+        active = "ACTIVE=active" in out
+        logs.append(f"service {service} active={active}")
+    except Exception as e:  # noqa: BLE001
+        logger.exception("deploy-draft failed")
+        return {
+            "success": False, "device_id": device_id, "service": service,
+            "verified": entry.get("verified", False),
+            "readings": (entry.get("result") or {}).get("samples"),
+            "message": f"Deploy failed: {e}", "logs": logs,
+        }
+    finally:
+        if ssh:
+            ssh.close()
+
+    # Firestore site schema (reuse _register_firestore_schema logic)
+    fs_proj, fs_ok = _write_site_schema_fs(
+        req.site_id, req.site_name or req.site_id, req.place,
+        entry.get("model", ""), device_id, config,
+    )
+
+    return {
+        "success": active,
+        "device_id": device_id,
+        "service": service,
+        "verified": entry.get("verified", False),
+        "readings": (entry.get("result") or {}).get("samples"),
+        "firestore_project": fs_proj if fs_ok else None,
+        "message": (f"Deployed {service} to {req.pi_host} (active={active}, "
+                    f"verified={entry.get('verified')}, firestore={'ok' if fs_ok else 'skipped'})"),
+        "logs": logs,
+    }
 
 # SCV Water 自訂 MAC 前綴 — 只掃描我們的樹莓派
 # 樹莓派出廠 MAC 前綴：b8:27:eb (Pi 1/2/3), dc:a6:32 (Pi 4), e4:5f:01 (Pi 4/5)

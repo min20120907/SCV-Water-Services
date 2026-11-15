@@ -1,0 +1,13 @@
+# SCV Water real-sensor driver — Raspberry Pi Zero 2 W (aarch64, Python 3.13)
+# Install:  python3 -m venv venv && venv/bin/pip install -r requirements.txt
+
+# I2C (BH1750 light, BME280 temp/pressure/humidity)
+smbus2>=0.4.2
+
+# GPIO — lgpio is the primary backend (works on Pi 5 / RP1), RPi.GPIO is the fallback.
+# Either one is enough to run the GPIO sensors (HC-SR04, YF-S201, DHT22).
+lgpio>=0.2.0
+RPi.GPIO>=0.7.0
+
+# Firestore cloud writes (optional at import — the driver degrades to no-write if absent)
+firebase-admin>=6.0.0

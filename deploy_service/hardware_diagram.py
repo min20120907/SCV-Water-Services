@@ -96,7 +96,24 @@ def build_ir(site_id: str, site_name: str, sensors: list[dict[str, Any]]) -> dic
         # Rail vocabulary must match wiring_gen/src/pi_hardware.py RAIL_PINS.
         vcc = "3V3" if stype in {"bme280", "bh1750", "dht22", "ds18b20", "ssd1306",
                                   "mpu6050", "ina219", "gpio_3pin"} else "5V"
-        bcm = GPIO_POOL[i] if i < len(GPIO_POOL) else None
+        bcm = None
+        if stype not in {"bme280", "bh1750", "ssd1306", "ina219"}:
+            # Prefer the pin registry shared with the deploy driver so the
+            # diagram and the deployed config use the same GPIO (fixes the
+            # pool-index collision where the same model always got the same pin).
+            try:
+                from sensors_deploy import get_site_pins
+                site_pins = get_site_pins(site_id, stype) or {}
+            except Exception:
+                site_pins = {}
+            for pref in ("trig", "signal", "data"):
+                if pref in site_pins:
+                    bcm = site_pins[pref]
+                    break
+            if bcm is None and site_pins:
+                bcm = next(iter(site_pins.values()))
+            if bcm is None:
+                bcm = GPIO_POOL[i] if i < len(GPIO_POOL) else None
 
         comps.append({
             "id": cid, "type": stype, "name": name,
